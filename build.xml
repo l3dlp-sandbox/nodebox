@@ -223,7 +223,7 @@
 
     <target name="dist-win" depends="resources" description="Final build on Windows">
         <mkdir dir="${dist.windows}" />
-        <exec executable="jpackage">
+        <exec executable="jpackage" failonerror="true">
             <arg line="-i ${dist.unpacked}"/>
             <arg line="-d ${dist.windows}"/>
             <arg line="-n NodeBox"/>
@@ -242,7 +242,7 @@
 
 
     <target name="dist-mac" depends="resources">
-        <exec executable="${jpackage}" os="Mac OS X">
+        <exec executable="${jpackage}" os="Mac OS X" failonerror="true">
             <arg line="-i ${dist.unpacked}"/>
             <arg line="-d ${dist.mac}"/>
             <arg line="-n NodeBox"/>
@@ -252,7 +252,7 @@
             <arg line="--type app-image"/>
             <arg line="--mac-package-identifier be.emrg.nodebox"/>
             <arg line="--mac-package-name NodeBox"/>
-            <arg line="--resource-dir dist/resources"/>
+            <arg line="--resource-dir ${dist.res}"/>
             <arg line="--icon platform/mac/res/Resources/nodebox.icns"/>
             <arg line="--file-associations platform/fa-ndbx.properties"/>
         </exec>
@@ -260,9 +260,9 @@
 
     <target name="sign-mac" depends="init">
         <javac srcdir="${dev}" destdir="${build.dev}" deprecation="yes" includeantruntime="false"/>
-        <java classname="nodebox.PackageSigner" fork="true" classpath="${build.dev}"/>
+        <java classname="nodebox.PackageSigner" fork="true" failonerror="true" classpath="${build.dev}"/>
         <!-- Create a DMG file -->
-        <exec executable="${jpackage}" os="Mac OS X">
+        <exec executable="${jpackage}" os="Mac OS X" failonerror="true">
             <arg line="-n NodeBox"/>
             <arg line="-d ${dist.mac}"/>
             <arg line="--app-version ${nodebox.version}"/>
@@ -270,7 +270,7 @@
             <arg line="--app-version ${nodebox.version}"/>
         </exec>
         <!-- Notarize the DMG file -->
-        <java classname="nodebox.Notarizer" fork="true" classpath="${build.dev}">
+        <java classname="nodebox.Notarizer" fork="true" failonerror="true" classpath="${build.dev}">
             <arg line="dist/mac/NodeBox-${nodebox.version}.dmg"/>
         </java>
     </target>
