@@ -27,6 +27,12 @@
         <!-- jpackage from the JDK running this build; produces a native app for that JDK's architecture.
              Override with -Djpackage=/path/to/bin/jpackage to target a different JDK. -->
         <property name="jpackage" location="${java.home}/bin/jpackage"/>
+        <!-- macOS signing identity; matches PackageSigner's default, overridable via MACOS_SIGN_IDENTITY. -->
+        <property environment="env"/>
+        <condition property="sign.identity" value="${env.MACOS_SIGN_IDENTITY}">
+            <isset property="env.MACOS_SIGN_IDENTITY"/>
+        </condition>
+        <property name="sign.identity" value="Developer ID Application: Frederik De Bleser (5X78EYG9RH)"/>
         <property name="build" value="build"/>
         <property name="build.prod" location="${build}/prod"/>
         <property name="build.test" location="${build}/test"/>
@@ -261,13 +267,18 @@
     <target name="sign-mac" depends="init">
         <javac srcdir="${dev}" destdir="${build.dev}" deprecation="yes" includeantruntime="false"/>
         <java classname="nodebox.PackageSigner" fork="true" failonerror="true" classpath="${build.dev}"/>
-        <!-- Create a DMG file -->
-        <exec executable="${jpackage}" os="Mac OS X" failonerror="true">
-            <arg line="-n NodeBox"/>
-            <arg line="-d ${dist.mac}"/>
-            <arg line="--app-version ${nodebox.version}"/>
-            <arg line="--app-image dist/mac/NodeBox.app"/>
-            <arg line="--app-version ${nodebox.version}"/>
+        <!-- Build the DMG with hdiutil, NOT jpackage: jpackage's dmg packaging re-signs the
+             app-image with an ad-hoc signature, clobbering the Developer ID signatures
+             PackageSigner just applied to the runtime dylibs (notarization then rejects them). -->
+        <exec executable="hdiutil" os="Mac OS X" failonerror="true">
+            <arg line="create -volname NodeBox -srcfolder ${dist.mac}/NodeBox.app -ov -format UDZO ${dist.mac}/NodeBox-${nodebox.version}.dmg"/>
+        </exec>
+        <!-- Sign the DMG itself. -->
+        <exec executable="codesign" os="Mac OS X" failonerror="true">
+            <arg value="--sign"/>
+            <arg value="${sign.identity}"/>
+            <arg value="--timestamp"/>
+            <arg value="${dist.mac}/NodeBox-${nodebox.version}.dmg"/>
         </exec>
         <!-- Notarize the DMG file -->
         <java classname="nodebox.Notarizer" fork="true" failonerror="true" classpath="${build.dev}">
