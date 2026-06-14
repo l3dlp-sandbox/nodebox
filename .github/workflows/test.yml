@@ -9,14 +9,19 @@ on:
         required: false
         default: "false"
 
+env:
+  # Run JS actions on Node 24, silencing Node 20 deprecation warnings for actions
+  # without a Node-24 release yet (e.g. upload-artifact) ahead of the forced migration.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set up JDK 25
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '25'
@@ -36,9 +41,9 @@ jobs:
       NODEBOX_E2E_FORCE_FAIL: ${{ github.event_name == 'workflow_dispatch' && inputs.e2eFail == 'true' && '1' || '0' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set up JDK 25
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '25'

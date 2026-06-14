@@ -1,0 +1,120 @@
+name: Build installers
+
+on:
+  push:
+    branches: [master] # nightly builds -> workflow artifacts
+    tags: ['v*']        # versioned releases -> GitHub Release
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create/attach GitHub Releases on tags
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    env:
+      # The same Temurin JDK is used on both runners; jpackage bundles a runtime
+      # matching that JDK's architecture (arm64 on macos-latest, x64 on windows-latest).
+      JAVA_VERSION: '25'
+      # Run JS actions on Node 24. checkout/setup-java are pinned to Node-24 majors below;
+      # this covers actions without a Node-24 release yet (upload-artifact, gh-release) and
+      # silences the Node 20 deprecation warnings ahead of GitHub's forced migration.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      # macOS signing/notarization. Steps that need these are skipped when the secrets
+      # are absent (e.g. PRs from forks), so the build still produces an unsigned app.
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Install Ant (macOS)
+        if: runner.os == 'macOS'
+        run: command -v ant >/dev/null 2>&1 || brew install ant
+
+      - name: Install Ant and WiX (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ant -y --no-progress
+          choco install wixtoolset -y --no-progress
+
+      # ---------- macOS ----------
+      - name: Import code-signing certificate (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Make the keychain the default and add it to the search list so codesign sees it.
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "== code-signing identities visible to codesign (use one of these names for MACOS_SIGN_IDENTITY) =="
+          security find-identity -v -p codesigning
+
+      - name: Build, sign and notarize (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        run: ant dist-mac sign-mac
+
+      - name: Verify signing & notarization (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        run: bash platform/mac/verify-signing.sh dist/mac/NodeBox.app "$(ls dist/mac/NodeBox-*.dmg)"
+
+      - name: Build unsigned app (macOS, no signing secrets)
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE == ''
+        run: |
+          ant dist-mac
+          ditto -c -k --keepParent "dist/mac/NodeBox.app" "dist/mac/NodeBox-unsigned.zip"
+
+      # ---------- Windows ----------
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: ant dist-win
+
+      # ---------- publish ----------
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodebox-${{ runner.os }}
+          path: |
+            dist/mac/NodeBox-*.dmg
+            dist/mac/NodeBox-*.zip
+            dist/windows/*.msi
+          if-no-files-found: ignore
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/mac/NodeBox-*.dmg
+            dist/windows/*.msi
+          fail_on_unmatched_files: false
