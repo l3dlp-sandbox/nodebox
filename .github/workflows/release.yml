@@ -2,7 +2,7 @@ name: Build installers
 
 on:
   push:
-    branches: [master, ci/reproducible-native-builds] # TODO: drop the PR branch before merge
+    branches: [master] # nightly builds -> workflow artifacts
     tags: ['v*']        # versioned releases -> GitHub Release
   workflow_dispatch:
 
