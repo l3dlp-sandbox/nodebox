@@ -35,7 +35,9 @@ public class PackageSigner {
         command.add("--sign");
         command.add(IDENTITY);
         command.add("--timestamp");
-        command.add("--deep");
+        // No --deep: nested code is signed individually (inside-out) by scanRecursive.
+        // --deep would re-sign that nested code without a per-binary secure timestamp,
+        // which Apple's notary service rejects.
         command.add("-vvvv");
         command.add("-f");
         command.add("--entitlements");
