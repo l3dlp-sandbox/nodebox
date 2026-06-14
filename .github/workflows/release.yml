@@ -2,7 +2,7 @@ name: Build installers
 
 on:
   push:
-    branches: [master] # nightly builds -> workflow artifacts
+    branches: [master, ci/reproducible-native-builds] # TODO: drop the PR branch before merge
     tags: ['v*']        # versioned releases -> GitHub Release
   workflow_dispatch:
 
@@ -75,6 +75,21 @@ jobs:
       - name: Build, sign and notarize (macOS)
         if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
         run: ant dist-mac sign-mac
+
+      - name: Verify signing & notarization (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        run: |
+          set -euo pipefail
+          APP="dist/mac/NodeBox.app"
+          DMG="$(ls dist/mac/NodeBox-*.dmg)"
+          echo "== codesign --verify (deep, strict) =="
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "== signing authority & hardened runtime flag =="
+          codesign -dvv "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags="
+          echo "== Gatekeeper assessment (must say: accepted / Notarized Developer ID) =="
+          spctl -a -vvv --type exec "$APP"
+          echo "== stapled notarization ticket on the dmg =="
+          xcrun stapler validate "$DMG"
 
       - name: Build unsigned app (macOS, no signing secrets)
         if: runner.os == 'macOS' && env.MACOS_CERTIFICATE == ''
