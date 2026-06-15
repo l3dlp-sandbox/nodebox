@@ -20,10 +20,22 @@ public final class NodeContext {
     private final Map<String, Node> nodeMap;
     private final FunctionRepository functionRepository;
     private final ImmutableMap<String, ?> data;
-    private final ImmutableMap<String, List<?>> previousRenderResults;
     private final Map<String, List<?>> renderResults;
     private final Map<NodeArguments, List<?>> nodeArgumentsResults;
     private final Map<String, ?> portOverrides;
+
+    // Cross-render result cache, shared across NodeContext instances (each render builds a fresh
+    // context but reuses the document's cache). May be null, in which case nothing is cached across
+    // renders (e.g. in isolated unit tests). See RenderCache for the caching/invalidation model.
+    private final RenderCache renderCache;
+
+    // Per-network lookup from an (input node, input port) pair to the node connected to its output.
+    // findOutputNode is called for every input port of every child invocation; without this cache it
+    // performs a linear scan over all of a network's connections (and children) on each call, which is
+    // O(invocations * connections). The cache is keyed by network node identity; node instances are
+    // immutable and shared within a single render, so identity keying is safe and avoids recomputing
+    // the (expensive) value-based hashCode/equals of a whole network.
+    private final Map<Node, Map<String, Node>> outputNodeCache = new IdentityHashMap<Node, Map<String, Node>>();
 
     private static final ImmutableMap<String, ?> DEFAULT_CONTEXT_DATA = ImmutableMap.of("frame", 1.0);
 
@@ -32,22 +44,22 @@ public final class NodeContext {
     }
 
     public NodeContext(NodeLibrary nodeLibrary, FunctionRepository functionRepository) {
-        this(nodeLibrary, functionRepository, DEFAULT_CONTEXT_DATA, ImmutableMap.<String, List<?>>of(), ImmutableMap.<String,Object>of());
+        this(nodeLibrary, functionRepository, DEFAULT_CONTEXT_DATA, ImmutableMap.<String, Object>of(), null);
     }
 
     public NodeContext(NodeLibrary nodeLibrary, FunctionRepository functionRepository, Map<String, ?> data) {
-        this(nodeLibrary, functionRepository, data, ImmutableMap.<String, List<?>>of(), ImmutableMap.<String,Object>of());
+        this(nodeLibrary, functionRepository, data, ImmutableMap.<String, Object>of(), null);
     }
 
-    public NodeContext(NodeLibrary nodeLibrary, FunctionRepository functionRepository, Map<String, ?> data, Map<String, List<?>> previousRenderResults, Map<String, ?> portOverrides) {
+    public NodeContext(NodeLibrary nodeLibrary, FunctionRepository functionRepository, Map<String, ?> data, Map<String, ?> portOverrides, RenderCache renderCache) {
         this.nodeLibrary = nodeLibrary;
         this.nodeMap = nodeLibrary.getFlattenedNodeMap();
         this.functionRepository = functionRepository != null ? functionRepository : nodeLibrary.getFunctionRepository();
         this.data = ImmutableMap.copyOf(data);
         this.renderResults = new HashMap<String, List<?>>();
         this.nodeArgumentsResults = new HashMap<NodeArguments, List<?>>();
-        this.previousRenderResults = ImmutableMap.copyOf(previousRenderResults);
         this.portOverrides = ImmutableMap.copyOf(portOverrides);
+        this.renderCache = renderCache;
     }
 
     public NodeLibrary getNodeLibrary() {
@@ -70,10 +82,6 @@ public final class NodeContext {
 
     public Map<String, ?> getData() {
         return data;
-    }
-
-    public Map<String, List<?>> getRenderResults() {
-        return renderResults;
     }
 
     private Node getNodeForPath(String nodePath) {
@@ -171,13 +179,45 @@ public final class NodeContext {
             String childPath = getChildPath(networkPath, child.getName());
             return renderNode(childPath);
         } else {
-            // The list of values that need to be processed for this port.
-            Map<Port, List<?>> portArguments = new LinkedHashMap<Port, List<?>>();
+            // Whether this child's result may be reused across renders (see RenderCache). Published-port
+            // overrides and port overrides are not part of the cache key, so caching is disabled when
+            // either is in play; both are absent in normal rendering.
+            boolean cacheable = renderCache != null
+                    && networkArgumentMap.isEmpty()
+                    && portOverrides.isEmpty()
+                    && renderCache.isCacheable(child);
+            // Identities of the result lists feeding the connected input ports; these form the cache key
+            // together with the child node itself (which captures its function and literal port values).
+            List<List<?>> connectedInputs = cacheable ? new ArrayList<List<?>>() : null;
 
-            // Evaluate the port data.
+            // Evaluate the raw port data. This recurses into the upstream nodes, which hit their own
+            // caches; the results' identities are stable across renders for unchanged subgraphs.
+            Map<Port, List<?>> rawArguments = new LinkedHashMap<Port, List<?>>();
             for (Port port : child.getInputs()) {
                 List<?> result = evaluatePort(networkPath, child, port, networkArgumentMap);
-                result = convertResultsForPort(port, result);
+                rawArguments.put(port, result);
+                if (cacheable && findOutputNode(network, child, port) != null) {
+                    connectedInputs.add(result);
+                }
+            }
+
+            // Reuse a previously computed result for the same node and the same inputs, before doing any
+            // type-conversion or invocation work.
+            RenderCache.Key cacheKey = null;
+            if (cacheable) {
+                cacheKey = RenderCache.key(child, connectedInputs);
+                List<?> cached = renderCache.get(cacheKey);
+                if (cached != null) {
+                    nodeArgumentsResults.put(nodeArguments, cached);
+                    return cached;
+                }
+            }
+
+            // Convert and clamp the evaluated port values, ready to be passed to the function.
+            Map<Port, List<?>> portArguments = new LinkedHashMap<Port, List<?>>();
+            for (Map.Entry<Port, List<?>> entry : rawArguments.entrySet()) {
+                Port port = entry.getKey();
+                List<?> result = convertResultsForPort(port, entry.getValue());
                 result = clampResultsForPort(port, result);
                 portArguments.put(port, result);
             }
@@ -206,6 +246,10 @@ public final class NodeContext {
             for (Map<Port, ?> argumentMap : argumentMaps) {
                 List<?> results = renderNode(childPath, argumentMap);
                 resultsList.addAll(results);
+            }
+
+            if (cacheable) {
+                renderCache.put(cacheKey, resultsList);
             }
         }
         nodeArgumentsResults.put(nodeArguments, resultsList);
@@ -260,12 +304,20 @@ public final class NodeContext {
     }
 
     private Node findOutputNode(Node network, Node inputNode, Port inputPort) {
-        for (Connection c : network.getConnections()) {
-            if (c.getInputNode().equals(inputNode.getName()) && c.getInputPort().equals(inputPort.getName())) {
-                return network.getChild(c.getOutputNode());
-            }
+        Map<String, Node> lookup = outputNodeCache.get(network);
+        if (lookup == null) {
+            lookup = buildOutputNodeLookup(network);
+            outputNodeCache.put(network, lookup);
         }
-        return null;
+        return lookup.get(inputNode.getName() + " " + inputPort.getName());
+    }
+
+    private static Map<String, Node> buildOutputNodeLookup(Node network) {
+        Map<String, Node> lookup = new HashMap<String, Node>();
+        for (Connection c : network.getConnections()) {
+            lookup.put(c.getInputNode() + " " + c.getInputPort(), network.getChild(c.getOutputNode()));
+        }
+        return lookup;
     }
 
     private List<?> evaluatePort(String networkPath, Node child, Port childPort, Map<Port, ?> networkArgumentMap) {
@@ -323,14 +375,6 @@ public final class NodeContext {
         Object portValue = overrideValue == null ? port.getValue() : overrideValue;
         if (port.getType().equals("context")) {
             return this;
-        } else if (port.getType().equals(Port.TYPE_STATE)) {
-            // The state of the node is the output value of the previous render of that node.
-            Object previousState = previousRenderResults.get(nodePath);
-            if (previousState != null) {
-                return previousState;
-            } else {
-                return ImmutableList.of();
-            }
         } else if (port.isFileWidget() && !port.stringValue().isEmpty()) {
             return convertToFileName(portValue);
         }

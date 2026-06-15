@@ -706,7 +706,7 @@ public class NodeContextTest {
         // With no overrides, the add node returns 8.0
         assertResultsEqual(net, addNode, 8.0);
         ImmutableMap<String, ?> overrides = ImmutableMap.of("number3.number", 10.0);
-        NodeContext ctx = new NodeContext(testLibrary.withRoot(net), null, ImmutableMap.<String, Object>of(), ImmutableMap.<String, List<?>>of(), overrides);
+        NodeContext ctx = new NodeContext(testLibrary.withRoot(net), null, ImmutableMap.<String, Object>of(), overrides, null);
         Iterable<?> values = ctx.renderChild("/", addNode);
         assertResultsEqual(values, 15.0);
     }

@@ -2,7 +2,6 @@ package nodebox.function;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Iterables;
 import netP5.UdpClient;
 import nodebox.graphics.Point;
 import nodebox.node.NodeContext;
@@ -21,7 +20,7 @@ public class DeviceFunctions {
     public static final FunctionLibrary LIBRARY;
 
     static {
-        LIBRARY = JavaLibrary.ofClass("device", DeviceFunctions.class, "mousePosition", "bufferPoints", "receiveOSC", "sendOSC",
+        LIBRARY = JavaLibrary.ofClass("device", DeviceFunctions.class, "mousePosition", "receiveOSC", "sendOSC",
                 "audioAnalysis", "audioLogAvg", "audioWave", "beatDetect");
     }
 
@@ -32,17 +31,6 @@ public class DeviceFunctions {
         } else {
             return Point.ZERO;
         }
-    }
-
-    public static List<Point> bufferPoints(Point point, long size, final List<Point> previousPoints) {
-        ImmutableList.Builder<Point> newPoints = ImmutableList.builder();
-        if (previousPoints.size() == size) {
-            newPoints.addAll(Iterables.skip(previousPoints, 1));
-        } else {
-            newPoints.addAll(previousPoints);
-        }
-        newPoints.add(point);
-        return newPoints.build();
     }
 
     @SuppressWarnings("unchecked")

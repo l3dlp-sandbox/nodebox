@@ -90,7 +90,10 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
     private Map<String, double[]> networkPanZoomValues = new HashMap<String, double[]>();
     private SwingWorker<List<?>, Node> currentRender = null;
     private Iterable<?> lastRenderResult = null;
-    private Map<String, List<?>> renderResults = ImmutableMap.of();
+    // Caches node results across renders so that unchanged parts of the network are not recomputed
+    // on every frame change or parameter tweak. Read and reassigned only on the EDT; a running render
+    // worker keeps the reference it was given, so resetting (below) never mutates an in-flight cache.
+    private RenderCache renderCache = new RenderCache();
     private JSplitPane parameterNetworkSplit;
     private JSplitPane topSplit;
     private FullScreenFrame fullScreenFrame = null;
@@ -1256,13 +1259,12 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
             handler.addData(dataMap);
         final ImmutableMap<String, ?> data = ImmutableMap.copyOf(dataMap);
 
-        final NodeContext context = new NodeContext(renderLibrary, getFunctionRepository(), data, renderResults, ImmutableMap.<String, Object>of());
+        final NodeContext context = new NodeContext(renderLibrary, getFunctionRepository(), data, ImmutableMap.<String, Object>of(), renderCache);
         currentRender = new SwingWorker<List<?>, Node>() {
             @Override
             protected List<?> doInBackground() throws Exception {
                 List<?> results = context.renderNode(renderNetwork);
                 context.renderAlwaysRenderedNodes(renderNetwork);
-                renderResults = context.getRenderResults();
                 return results;
             }
 
@@ -1317,7 +1319,9 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
     }
 
     private synchronized void resetRenderResults() {
-        renderResults = ImmutableMap.of();
+        // Swap in a fresh cache rather than clearing the existing one: a background render may still be
+        // using the current instance, and reassigning the reference avoids mutating it concurrently.
+        renderCache = new RenderCache();
     }
 
     //// Undo ////
@@ -1676,17 +1680,18 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
         Thread t = new Thread(new Runnable() {
             public void run() {
                 try {
-                    Map<String, List<?>> renderResults = ImmutableMap.of();
+                    // A cache shared across the exported frames: frame-independent parts of the network
+                    // are computed once for the whole sequence.
+                    RenderCache exportCache = new RenderCache();
                     for (int frame = fromValue; frame <= toValue; frame++) {
                         if (Thread.currentThread().isInterrupted())
                             break;
                         HashMap<String, Object> data = new HashMap<String, Object>();
                         data.put("frame", (double) frame);
                         data.put("mouse.position", viewer.getLastMousePosition());
-                        NodeContext context = new NodeContext(exportLibrary, exportFunctionRepository, data, renderResults, ImmutableMap.<String, Object>of());
+                        NodeContext context = new NodeContext(exportLibrary, exportFunctionRepository, data, ImmutableMap.<String, Object>of(), exportCache);
 
                         List<?> results = context.renderNode("/");
-                        renderResults = context.getRenderResults();
                         viewer.setOutputValues((List<?>) results);
                         exportDelegate.frameDone(frame, results);
 

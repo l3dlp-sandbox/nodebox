@@ -37,7 +37,7 @@ public class NodeLibrary {
 
     private static final Pattern NUMBER_AT_THE_END = Pattern.compile("^(.*?)(\\d*)$");
 
-    public static final String CURRENT_FORMAT_VERSION = "21";
+    public static final String CURRENT_FORMAT_VERSION = "22";
 
     public static final Splitter PORT_NAME_SPLITTER = Splitter.on(".");
 
@@ -167,6 +167,12 @@ public class NodeLibrary {
     private final ImmutableList<Device> devices;
     private final UUID uuid;
 
+    // The flattened node map is a pure function of the (immutable) root node, but it is relatively
+    // expensive to build. It is rebuilt on every render (once per NodeContext), so we cache it lazily.
+    // A benign data race is acceptable here: two threads may both compute it, but they produce equal
+    // maps and the result is immutable.
+    private volatile ImmutableMap<String, Node> flattenedNodeMap;
+
     private NodeLibrary(String name, File file, Node root, NodeRepository nodeRepository, FunctionRepository functionRepository, Map<String, String> properties, List<Device> devices, UUID uuid) {
         checkNotNull(name, "Name cannot be null.");
         checkNotNull(root, "Root node cannot be null.");
@@ -219,9 +225,14 @@ public class NodeLibrary {
     }
 
     public ImmutableMap<String, Node> getFlattenedNodeMap() {
-        Map<String, Node> map = getFlattenedNodeMap("/", root);
-        map.put("/", root);
-        return ImmutableMap.copyOf(map);
+        ImmutableMap<String, Node> result = flattenedNodeMap;
+        if (result == null) {
+            Map<String, Node> map = getFlattenedNodeMap("/", root);
+            map.put("/", root);
+            result = ImmutableMap.copyOf(map);
+            flattenedNodeMap = result;
+        }
+        return result;
     }
 
     private Map<String, Node> getFlattenedNodeMap(String path, Node network) {
