@@ -13,6 +13,7 @@
 ## Build, Test, and Development Commands
 - `ant run` builds and launches NodeBox.
 - `ant test` compiles and runs JUnit tests; XML reports land in `reports/`.
+- `ant test-perf` runs the drag-responsiveness measurement harness (needs a display); writes `build/e2e-artifacts/drag-perf.txt`. Pick a scenario with `-Dperf.example=… -Dperf.node=… -Dperf.port=…`.
 - `ant generate-test-reports` renders HTML reports from `reports/TEST-*.xml`.
 - `ant dist-mac` / `ant dist-win` create packaged apps in `dist/`.
 - `ant clean` removes build artifacts.

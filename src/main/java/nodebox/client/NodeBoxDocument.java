@@ -17,6 +17,7 @@ import nodebox.node.*;
 import nodebox.ui.*;
 import nodebox.util.FileUtils;
 import nodebox.util.LoadException;
+import nodebox.util.PerfMonitor;
 import static nodebox.ui.Platform.COMMAND_DOWN_MASK;
 
 import javax.imageio.ImageIO;
@@ -32,9 +33,6 @@ import java.io.StringWriter;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.*;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.google.common.base.Preconditions.*;
 
@@ -60,8 +58,18 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
     // State
     private final NodeLibraryController controller;
     // Rendering
-    private final AtomicBoolean isRendering = new AtomicBoolean(false);
-    private final AtomicBoolean shouldRender = new AtomicBoolean(false);
+    // Interactive render loop (see startRenderLoop / requestRender). A single long-lived background
+    // thread renders the most recently requested state, conflating rapid requests such as a parameter
+    // drag. The EDT only publishes a snapshot and wakes the thread; results come back via one
+    // invokeLater. This keeps every render off the EDT (an expensive render can never freeze the UI)
+    // while paying far less per-frame latency than allocating a fresh SwingWorker per change.
+    private final Object renderLock = new Object();
+    private RenderRequest pendingRequest = null;          // guarded by renderLock; newest unrendered request
+    private boolean renderLoopRunning = true;             // guarded by renderLock
+    private int renderGeneration = 0;                     // guarded by renderLock; identifies each request
+    private volatile int canceledGeneration = -1;         // requests with generation <= this are discarded
+    private Thread renderThread;
+    private volatile long activeRenderStartNanos = 0;     // 0 = idle, else nanoTime() the current render began
     // GUI components
     private final NodeBoxMenuBar menuBar;
     private final AnimationBar animationBar;
@@ -88,7 +96,11 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
     private boolean invalidateFunctionRepository = false;
     private double frame = 1;
     private Map<String, double[]> networkPanZoomValues = new HashMap<String, double[]>();
-    private SwingWorker<List<?>, Node> currentRender = null;
+    // Polls the active render's elapsed time and shows the progress spinner only for renders that
+    // run long enough to be perceived, so fast interactive renders never flicker it.
+    private javax.swing.Timer progressTimer;
+    private boolean progressShown = false;
+    private static final long SLOW_RENDER_NANOS = 150_000_000L; // 150 ms
     private Iterable<?> lastRenderResult = null;
     // Caches node results across renders so that unchanged parts of the network are not recomputed
     // on every frame change or parameter tweak. Read and reassigned only on the EDT; a running render
@@ -181,6 +193,8 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
             devicesDialog = new DevicesDialog(this);
 //            addressBar.setMessage("OSC Port " + getOSCPort());
         }
+
+        startRenderLoop();
     }
 
     public static NodeBoxDocument getCurrentDocument() {
@@ -1192,21 +1206,33 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
     //// Rendering ////
 
     /**
-     * Request a renderNetwork operation.
+     * Request a render of the current network.
      * <p/>
-     * This method does a number of checks to see if the renderNetwork goes through.
-     * <p/>
-     * The renderer could already be running.
-     * <p/>
-     * If all checks pass, a renderNetwork request is made.
+     * Snapshots everything the render needs from the (EDT-owned) document state, publishes it to the
+     * background render thread as the latest pending request, and wakes the thread. Rapid successive
+     * calls (e.g. a parameter drag) conflate: the thread always renders the newest snapshot, so no
+     * intermediate frame can block a later one and the final value is always rendered.
      */
     public void requestRender() {
-        // If we're already rendering, request the next renderNetwork.
-        if (isRendering.compareAndSet(false, true)) {
-            // If we're not rendering, start rendering.
-            render();
-        } else {
-            shouldRender.set(true);
+        checkState(SwingUtilities.isEventDispatchThread());
+        PerfMonitor.recordRenderRequest();
+        final NodeLibrary library = getNodeLibrary();
+        final FunctionRepository functions = getFunctionRepository();
+        final String renderNetwork = getRenderedNode();
+        final RenderCache cache = renderCache;
+
+        Map<String, Object> dataMap = new HashMap<String, Object>();
+        dataMap.put("frame", frame);
+        dataMap.put("mouse.position", viewerPane.getViewer().getLastMousePosition());
+        for (DeviceHandler handler : deviceHandlers)
+            handler.addData(dataMap);
+        final ImmutableMap<String, ?> data = ImmutableMap.copyOf(dataMap);
+
+        synchronized (renderLock) {
+            if (pendingRequest != null)
+                PerfMonitor.recordRenderCoalesced();
+            pendingRequest = new RenderRequest(++renderGeneration, library, functions, data, renderNetwork, cache);
+            renderLock.notifyAll();
         }
     }
 
@@ -1238,73 +1264,149 @@ public class NodeBoxDocument extends JFrame implements WindowListener, HandleDel
 
     /**
      * Ask the document to stop the active rendering.
+     * <p/>
+     * Drops any queued render and marks everything requested so far as canceled, so a render that is
+     * already running has its (now unwanted) result discarded when it finishes. The previously shown
+     * output is kept on screen rather than blanked.
      */
-    public synchronized void stopRendering() {
-        if (currentRender != null) {
-            currentRender.cancel(true);
+    public void stopRendering() {
+        Thread t;
+        synchronized (renderLock) {
+            pendingRequest = null;
+            canceledGeneration = renderGeneration;
+            t = renderThread;
+        }
+        if (t != null) t.interrupt();
+    }
+
+    /**
+     * Start the long-lived render thread and the progress-spinner poll timer. Called once from the
+     * constructor.
+     */
+    private void startRenderLoop() {
+        progressTimer = new javax.swing.Timer(100, new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                long start = activeRenderStartNanos;
+                boolean slow = start != 0 && (System.nanoTime() - start) > SLOW_RENDER_NANOS;
+                if (slow != progressShown) {
+                    progressShown = slow;
+                    progressPanel.setInProgress(slow);
+                }
+            }
+        });
+        progressTimer.start();
+
+        renderThread = new Thread("nodebox-render-" + System.identityHashCode(this)) {
+            @Override
+            public void run() {
+                renderLoop();
+            }
+        };
+        renderThread.setDaemon(true);
+        renderThread.start();
+    }
+
+    /**
+     * The body of the render thread: wait for a pending request, render the newest one off the EDT,
+     * and deliver the result back to the EDT. Never touches Swing state directly.
+     */
+    private void renderLoop() {
+        while (true) {
+            RenderRequest request;
+            synchronized (renderLock) {
+                while (renderLoopRunning && pendingRequest == null) {
+                    try {
+                        renderLock.wait();
+                    } catch (InterruptedException e) {
+                        // A stopRendering() interrupt; the loop conditions below are re-checked.
+                    }
+                }
+                if (!renderLoopRunning) return;
+                request = pendingRequest;
+                pendingRequest = null;
+            }
+
+            Thread.interrupted(); // clear any leftover interrupt before computing
+            activeRenderStartNanos = System.nanoTime();
+            List<?> results;
+            Throwable error = null;
+            try {
+                NodeContext context = new NodeContext(request.library, request.functions, request.data,
+                        ImmutableMap.<String, Object>of(), request.cache);
+                results = context.renderNode(request.network);
+                context.renderAlwaysRenderedNodes(request.network);
+            } catch (Throwable t) {
+                results = ImmutableList.of();
+                error = t;
+            }
+            final long renderNanos = System.nanoTime() - activeRenderStartNanos;
+            activeRenderStartNanos = 0;
+
+            final List<?> deliveredResults = results;
+            final Throwable deliveredError = error;
+            final int generation = request.generation;
+            SwingUtilities.invokeLater(new Runnable() {
+                @Override
+                public void run() {
+                    applyRenderResult(generation, deliveredResults, deliveredError, renderNanos);
+                }
+            });
         }
     }
 
-    private void render() {
-        checkState(SwingUtilities.isEventDispatchThread());
-        checkState(currentRender == null);
-        progressPanel.setInProgress(true);
-        final NodeLibrary renderLibrary = getNodeLibrary();
-        final String renderNetwork = getRenderedNode();
+    /** Apply a completed render's result on the EDT, unless it was canceled. */
+    private void applyRenderResult(int generation, List<?> results, Throwable error, long renderNanos) {
+        PerfMonitor.recordRender(renderNanos);
+        if (generation <= canceledGeneration) {
+            // Canceled via the stop button after this render started; keep the previous output.
+            return;
+        }
+        if (error == null) {
+            networkPane.clearError();
+        } else {
+            networkPane.setError(error);
+        }
+        lastRenderResult = results;
+        networkView.checkErrorAndRepaint();
+        if (fullScreenFrame != null)
+            fullScreenFrame.setOutputValues(results);
+        else
+            viewerPane.setOutputValues(results);
+    }
 
-        Map<String, Object> dataMap = new HashMap<String, Object>();
-        dataMap.put("frame", frame);
-        dataMap.put("mouse.position", viewerPane.getViewer().getLastMousePosition());
-        for (DeviceHandler handler : deviceHandlers)
-            handler.addData(dataMap);
-        final ImmutableMap<String, ?> data = ImmutableMap.copyOf(dataMap);
+    /** An immutable snapshot of everything a single render needs, captured on the EDT. */
+    private static final class RenderRequest {
+        final int generation;
+        final NodeLibrary library;
+        final FunctionRepository functions;
+        final ImmutableMap<String, ?> data;
+        final String network;
+        final RenderCache cache;
 
-        final NodeContext context = new NodeContext(renderLibrary, getFunctionRepository(), data, ImmutableMap.<String, Object>of(), renderCache);
-        currentRender = new SwingWorker<List<?>, Node>() {
-            @Override
-            protected List<?> doInBackground() throws Exception {
-                List<?> results = context.renderNode(renderNetwork);
-                context.renderAlwaysRenderedNodes(renderNetwork);
-                return results;
-            }
+        RenderRequest(int generation, NodeLibrary library, FunctionRepository functions,
+                      ImmutableMap<String, ?> data, String network, RenderCache cache) {
+            this.generation = generation;
+            this.library = library;
+            this.functions = functions;
+            this.data = data;
+            this.network = network;
+            this.cache = cache;
+        }
+    }
 
-            @Override
-            protected void done() {
-                networkPane.clearError();
-                isRendering.set(false);
-                currentRender = null;
-                List<?> results;
-                try {
-                    results = get();
-                } catch (CancellationException e) {
-                    results = ImmutableList.of();
-                } catch (InterruptedException e) {
-                    results = ImmutableList.of();
-                } catch (ExecutionException e) {
-                    networkPane.setError(e.getCause());
-                    results = ImmutableList.of();
-                }
-
-                lastRenderResult = results;
-
-                networkView.checkErrorAndRepaint();
-                progressPanel.setInProgress(false);
-                if (fullScreenFrame != null)
-                    fullScreenFrame.setOutputValues(results);
-                else
-                    viewerPane.setOutputValues(results);
-
-                if (shouldRender.getAndSet(false)) {
-                    SwingUtilities.invokeLater(new Runnable() {
-                        @Override
-                        public void run() {
-                            requestRender();
-                        }
-                    });
-                }
-            }
-        };
-        currentRender.execute();
+    @Override
+    public void dispose() {
+        Thread t;
+        synchronized (renderLock) {
+            renderLoopRunning = false;
+            pendingRequest = null;
+            t = renderThread;
+            renderLock.notifyAll();
+        }
+        if (t != null) t.interrupt();
+        if (progressTimer != null) progressTimer.stop();
+        super.dispose();
     }
 
     /**

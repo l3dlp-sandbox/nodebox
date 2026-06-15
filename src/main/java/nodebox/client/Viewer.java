@@ -7,6 +7,7 @@ import nodebox.graphics.IGeometry;
 import nodebox.handle.Handle;
 import nodebox.ui.Theme;
 import nodebox.ui.Zoom;
+import nodebox.util.PerfMonitor;
 
 import javax.swing.*;
 import java.awt.*;
@@ -249,6 +250,15 @@ public class Viewer extends ZoomableView implements OutputView, Zoom, MouseListe
 
     @Override
     public void paintComponent(Graphics g) {
+        long paintStart = PerfMonitor.isEnabled() ? System.nanoTime() : 0;
+        try {
+            paintViewer(g);
+        } finally {
+            if (paintStart != 0) PerfMonitor.recordPaint(System.nanoTime() - paintStart);
+        }
+    }
+
+    private void paintViewer(Graphics g) {
         if (!viewPositioned) {
             setViewPosition(getWidth() / 2.0, getHeight() / 2.0);
             viewPositioned = true;
